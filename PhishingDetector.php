@@ -5,6 +5,18 @@
 
 declare(strict_types=1);
 
+const KNOWN_BRANDS = ['google', 'paypal', 'microsoft', 'apple', 'amazon', 'facebook', 'netflix', 'instagram'];
+
+const TRUSTED_BRAND_SUBDOMAINS = [
+    'www', 'm', 'mobile', 'mail', 'news', 'support', 'help', 'developers', 'cloud',
+    'apis', 'play', 'maps', 'drive', 'docs', 'calendar', 'photos', 'accounts', 'my',
+];
+
+const SUSPICIOUS_SUBDOMAINS = [
+    'user', 'login', 'signin', 'secure', 'verify', 'account', 'banking', 'update',
+    'auth', 'password', 'wallet', 'payment', 'confirm', 'billing', 'security',
+];
+
 function analyze_url(string $inputUrl): array
 {
     $inputUrl = trim($inputUrl);
@@ -71,6 +83,30 @@ function analyze_url(string $inputUrl): array
         $reasons[] = 'Contains suspicious keyword(s): ' . implode(', ', $matched) . '.';
     }
 
+    // Typosquatting / misspelled brand domains (e.g. gooogle.com, paypa1.com)
+    $typosquat = find_typosquat_brand($host);
+    if ($typosquat !== null) {
+        $score += 55;
+        $flagCount++;
+        $reasons[] = 'Domain name closely resembles "' . $typosquat['brand'] . '" but is misspelled (' . $typosquat['found'] . ').';
+    }
+
+    // Suspicious subdomains on real brand domains (e.g. user.google.com)
+    $suspiciousSub = find_suspicious_brand_subdomain($host);
+    if ($suspiciousSub !== null) {
+        $score += 50;
+        $flagCount++;
+        $reasons[] = 'Uses a suspicious subdomain ("' . $suspiciousSub . '") on a known brand domain.';
+    }
+
+    // Brand name embedded in a non-official domain (e.g. google-user.com)
+    $fakeBrand = find_brand_in_fake_domain($host);
+    if ($fakeBrand !== null) {
+        $score += 50;
+        $flagCount++;
+        $reasons[] = 'Uses the brand name "' . $fakeBrand . '" in a non-official domain.';
+    }
+
     // URL shorteners
     $shorteners = ['bit.ly', 'tinyurl.com', 't.co', 'goo.gl', 'ow.ly', 'is.gd', 'buff.ly', 'cutt.ly', 'tiny.cc', 'rebrand.ly', 'shorturl.at', 'rb.gy', 'lnkd.in'];
     $isShortener = in_array($host, $shorteners, true);
@@ -88,15 +124,23 @@ function analyze_url(string $inputUrl): array
         $reasons[] = "Contains '@' which can hide the real destination (userinfo trick).";
     }
 
+    // Domain / URL existence on the internet
+    $hostExists = host_exists_on_internet($host);
+    if (!$hostExists) {
+        $score += 60;
+        $flagCount++;
+        $reasons[] = 'Domain does not exist on the internet (possibly fake or made-up URL).';
+    }
+
     $score = max(0, min(100, $score));
 
-    $hasCritical = $isIpHost || $isShortener || $hasAt;
+    $hasCritical = $isIpHost || $isShortener || $hasAt || $typosquat !== null
+        || $suspiciousSub !== null || $fakeBrand !== null || !$hostExists;
     $verdict = ($score >= 45 || $flagCount >= 2 || ($hasCritical && $score >= 30)) ? 'SUSPICIOUS' : 'SAFE';
 
-    // Safe = score 0 and a clear message (no misleading warnings)
     if ($verdict === 'SAFE') {
         $score = 0;
-        $reasons = ['No obvious phishing patterns detected.'];
+        $reasons = ['URL exists on the internet and no obvious phishing patterns were detected.'];
     }
 
     return [
@@ -106,6 +150,33 @@ function analyze_url(string $inputUrl): array
         'verdict' => $verdict,
         'reasons' => $reasons,
     ];
+}
+
+function host_exists_on_internet(string $host): bool
+{
+    if (filter_var($host, FILTER_VALIDATE_IP) !== false) {
+        return true;
+    }
+
+    if (function_exists('dns_get_record')) {
+        foreach ([DNS_A, DNS_AAAA, DNS_CNAME] as $type) {
+            $records = @dns_get_record($host, $type);
+            if (is_array($records) && $records !== []) {
+                return true;
+            }
+        }
+    }
+
+    if (@checkdnsrr($host, 'A') || @checkdnsrr($host, 'AAAA') || @checkdnsrr($host, 'CNAME')) {
+        return true;
+    }
+
+    $resolved = @gethostbyname($host);
+    if (is_string($resolved) && $resolved !== '' && $resolved !== $host) {
+        return true;
+    }
+
+    return false;
 }
 
 function normalize_url(string $url): string
@@ -185,10 +256,117 @@ function brand_used_as_impersonation(string $host, string $path, string $query, 
     return keyword_in_path($path, $query, $brand);
 }
 
+function normalize_homoglyphs(string $label): string
+{
+    return strtr(strtolower($label), [
+        '0' => 'o',
+        '1' => 'l',
+        '3' => 'e',
+        '5' => 's',
+        '@' => 'a',
+    ]);
+}
+
+function is_typosquat_of_brand(string $label, string $brand): bool
+{
+    $label = strtolower($label);
+    $brand = strtolower($brand);
+
+    if ($label === $brand) {
+        return false;
+    }
+
+    $normalized = normalize_homoglyphs($label);
+    if ($normalized === $brand) {
+        return true;
+    }
+
+    $maxLen = max(strlen($label), strlen($brand));
+    if ($maxLen < 4 || abs(strlen($label) - strlen($brand)) > 2) {
+        return false;
+    }
+
+    $distance = levenshtein($label, $brand);
+    if ($distance >= 1 && $distance <= 2) {
+        return true;
+    }
+
+    $normalizedDistance = levenshtein($normalized, $brand);
+    return $normalizedDistance >= 1 && $normalizedDistance <= 2;
+}
+
+function find_typosquat_brand(string $host): ?array
+{
+    $labels = get_host_labels($host);
+    if (count($labels) < 2) {
+        return null;
+    }
+
+    $domainLabel = $labels[count($labels) - 2];
+
+    foreach (KNOWN_BRANDS as $brand) {
+        if ($domainLabel === $brand) {
+            return null;
+        }
+        if (is_typosquat_of_brand($domainLabel, $brand)) {
+            return ['brand' => $brand, 'found' => $domainLabel];
+        }
+    }
+
+    return null;
+}
+
+function find_brand_in_fake_domain(string $host): ?string
+{
+    foreach (KNOWN_BRANDS as $brand) {
+        if (is_legitimate_brand_host($host, $brand)) {
+            continue;
+        }
+        foreach (get_host_labels($host) as $label) {
+            if (keyword_in_label($label, $brand)) {
+                return $brand;
+            }
+        }
+    }
+
+    return null;
+}
+
+function find_suspicious_brand_subdomain(string $host): ?string
+{
+    $labels = get_host_labels($host);
+    if (count($labels) < 3) {
+        return null;
+    }
+
+    $brandLabel = $labels[count($labels) - 2];
+    if (!in_array($brandLabel, KNOWN_BRANDS, true)) {
+        return null;
+    }
+
+    $subdomainCount = count($labels) - 2;
+    for ($i = 0; $i < $subdomainCount; $i++) {
+        $sub = $labels[$i];
+        if (in_array($sub, TRUSTED_BRAND_SUBDOMAINS, true)) {
+            continue;
+        }
+        if (in_array($sub, SUSPICIOUS_SUBDOMAINS, true)) {
+            return $sub;
+        }
+        foreach (SUSPICIOUS_SUBDOMAINS as $keyword) {
+            if (keyword_in_label($sub, $keyword)) {
+                return $sub;
+            }
+        }
+    }
+
+    return null;
+}
+
 function find_suspicious_keywords(string $host, string $path, string $query): array
 {
     $generic = ['login', 'verify', 'secure', 'banking', 'update', 'account'];
-    $brands = ['paypal', 'microsoft', 'google'];
+    $brands = KNOWN_BRANDS;
     $matched = [];
 
     foreach ($generic as $keyword) {
